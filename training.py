@@ -1,76 +1,149 @@
-import os
-import numpy as np
+import json
+import argparse
+
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 
+# Parse the dataset path from the command line so no machine-specific
+# paths are hardcoded in the script.
+parser = argparse.ArgumentParser(description="Train the animal classifier.")
+parser.add_argument(
+    "--data-dir",
+    default="raw-img",
+    help="Path to the dataset folder (one subfolder per class)",
+)
+args = parser.parse_args()
 
-# Set the path to the folder containing the raw images from Kaggle which contains 10 categories of animals
-root_folder = 'E:\Documents\School\Spring 2023\CS 4200 Artificial Intelligence\FINALPROJECTFROMSCRATCH\/raw-img'
+rootFolder = args.data_dir
+imageSize = (224, 224)
+batchSize = 32
 
-# Set the image size and batch size for training
-image_size = (224, 224)
-batch_size = 32
+# Phase 1 trains only the new classification head on top of the frozen
+# base model. Phase 2 unfreezes the top of the base model and fine-tunes
+# it with a much smaller learning rate.
+headEpochs = 10
+fineTuneEpochs = 5
+fineTuneFromLayer = 100
 
-# Set the number of training epochs
-num_epochs = 10
-
-# Create an ImageDataGenerator for data augmentation and normalization
-data_generator = ImageDataGenerator(
-    rescale=1.0 / 255.0,
+# Both generators use MobileNetV2's own preprocess_input (which scales
+# pixels to the -1..1 range) so training matches prediction exactly.
+# Augmentation is applied to the training data only.
+trainDataGenerator = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
     rotation_range=20,
     width_shift_range=0.2,
     height_shift_range=0.2,
     shear_range=0.2,
     zoom_range=0.2,
     horizontal_flip=True,
-    validation_split=0.2
+    validation_split=0.2,
 )
 
-# Create train and validation generators using the ImageDataGenerator
-train_generator = data_generator.flow_from_directory(
-    root_folder,
-    target_size=image_size,
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='training'
+# The validation generator only preprocesses. Validating on augmented
+# images gives a noisy, misleading accuracy number.
+validationDataGenerator = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
+    validation_split=0.2,
 )
 
-validation_generator = data_generator.flow_from_directory(
-    root_folder,
-    target_size=image_size,
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='validation'
+trainGenerator = trainDataGenerator.flow_from_directory(
+    rootFolder,
+    target_size=imageSize,
+    batch_size=batchSize,
+    class_mode="categorical",
+    subset="training",
+    seed=42,
 )
 
-# Load the pre-trained MobileNetV2 model without the top layer
-base_model = MobileNetV2(
-    weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+validationGenerator = validationDataGenerator.flow_from_directory(
+    rootFolder,
+    target_size=imageSize,
+    batch_size=batchSize,
+    class_mode="categorical",
+    subset="validation",
+    seed=42,
+    shuffle=False,
+)
 
-# Add a global average pooling layer and a dense output layer
-x = base_model.output
+# Save the class index mapping so prediction code always uses the exact
+# label order the model was trained with, instead of a hardcoded list.
+classIndices = trainGenerator.class_indices
+indexToLabel = {index: label for label, index in classIndices.items()}
+with open("class_labels.json", "w") as labelFile:
+    json.dump(indexToLabel, labelFile, indent=2)
+print(f"Saved class label mapping: {indexToLabel}")
+
+# Weight each class by its inverse frequency so common classes (like dog)
+# don't dominate training over rare ones (like elephant).
+labels = trainGenerator.classes
+totalSamples = len(labels)
+numClasses = trainGenerator.num_classes
+classWeights = {}
+for classIndex in range(numClasses):
+    classCount = int((labels == classIndex).sum())
+    classWeights[classIndex] = totalSamples / (numClasses * classCount)
+print(f"Class weights: {classWeights}")
+
+# Load the pre-trained MobileNetV2 base without its top layer, and freeze
+# it so phase 1 trains only the new head.
+baseModel = MobileNetV2(
+    weights="imagenet", include_top=False, input_shape=(224, 224, 3)
+)
+baseModel.trainable = False
+
+x = baseModel.output
 x = GlobalAveragePooling2D()(x)
-x = Dense(256, activation='relu')(x)
-predictions = Dense(train_generator.num_classes, activation='softmax')(x)
+x = Dense(256, activation="relu")(x)
+x = Dropout(0.3)(x)
+predictions = Dense(numClasses, activation="softmax")(x)
 
-# Create the final model
-model = Model(inputs=base_model.input, outputs=predictions)
+model = Model(inputs=baseModel.input, outputs=predictions)
 
-# Compile the model
-model.compile(optimizer='adam', loss='categorical_crossentropy',
-              metrics=['accuracy'])
-
-# Train the model
-model.fit(
-    train_generator,
-    steps_per_epoch=train_generator.samples // batch_size,
-    validation_data=validation_generator,
-    validation_steps=validation_generator.samples // batch_size,
-    epochs=num_epochs
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"],
 )
 
-# Save the trained model
-model.save('animal_classifier_model.h5')
+earlyStopping = tf.keras.callbacks.EarlyStopping(
+    monitor="val_accuracy", patience=3, restore_best_weights=True
+)
+
+print("Phase 1: training the classification head (base model frozen)")
+model.fit(
+    trainGenerator,
+    validation_data=validationGenerator,
+    epochs=headEpochs,
+    class_weight=classWeights,
+    callbacks=[earlyStopping],
+)
+
+# Phase 2: unfreeze the top of the base model and fine-tune it with a
+# very small learning rate so the pretrained features aren't destroyed.
+baseModel.trainable = True
+for layer in baseModel.layers[:fineTuneFromLayer]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-5),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+print("Phase 2: fine-tuning the top of the base model")
+model.fit(
+    trainGenerator,
+    validation_data=validationGenerator,
+    epochs=fineTuneEpochs,
+    class_weight=classWeights,
+    callbacks=[earlyStopping],
+)
+
+# Save in the modern Keras format (.h5 is legacy).
+model.save("animal_classifier_model.keras")
+print("Saved model to animal_classifier_model.keras")

@@ -1,0 +1,12 @@
+# Trained models are large binaries; keep them out of git
+*.h5
+*.keras
+
+# Dataset
+raw-img/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
